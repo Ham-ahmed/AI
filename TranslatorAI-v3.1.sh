@@ -18,7 +18,7 @@ NC='\033[0m' # No Color
 
 # Script configuration
 PLUGIN_NAME="TranslatorAI"
-VERSION="3.0"
+VERSION="3.1"
 GITHUB_RAW="https://raw.githubusercontent.com/Ham-ahmed/AI/refs/heads/main"
 # Try different possible package names
 PACKAGE_NAMES="${PLUGIN_NAME}-${VERSION}.tar.gz ${PLUGIN_NAME}.tar.gz ${PLUGIN_NAME}_${VERSION}.tar.gz plugin.tar.gz"
