@@ -4,29 +4,34 @@
 # Version: 3.1
 # Author: HAMDY_AHMED
 # Modified: Auto-restart after successful installation
+# Fixed: Internet check, extraction logic, and error handling
 #################################################################
 
-# Color definitions
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-WHITE='\033[1;37m'
-NC='\033[0m' # No Color
+# Color definitions (with fallback for non-tty)
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    BLUE='\033[0;34m'
+    YELLOW='\033[1;33m'
+    CYAN='\033[0;36m'
+    MAGENTA='\033[0;35m'
+    WHITE='\033[1;37m'
+    NC='\033[0m'
+else
+    RED=''; GREEN=''; BLUE=''; YELLOW=''; CYAN=''; MAGENTA=''; WHITE=''; NC=''
+fi
 
 # Script configuration
 PLUGIN_NAME="TranslatorAI"
 VERSION="3.1"
 GITHUB_RAW="https://raw.githubusercontent.com/Ham-ahmed/AI/refs/heads/main"
-# Try different possible package names
 PACKAGE_NAMES="${PLUGIN_NAME}-${VERSION}.tar.gz ${PLUGIN_NAME}.tar.gz ${PLUGIN_NAME}_${VERSION}.tar.gz plugin.tar.gz"
 TEMP_DIR="/var/volatile/tmp"
 INSTALL_LOG="${TEMP_DIR}/${PLUGIN_NAME}_install.log"
 ENIGMA2_PLUGINS_DIR="/usr/lib/enigma2/python/Plugins/Extensions"
 PLUGIN_DIR="${ENIGMA2_PLUGINS_DIR}/${PLUGIN_NAME}"
 BACKUP_DIR="${TEMP_DIR}/${PLUGIN_NAME}_backup"
+DOWNLOADER=""
 
 # =======================================
 # Function: Cleanup temporary files
@@ -34,12 +39,12 @@ BACKUP_DIR="${TEMP_DIR}/${PLUGIN_NAME}_backup"
 cleanup() {
     # Remove downloaded packages
     for pkg in ${PACKAGE_NAMES}; do
-        rm -f "${TEMP_DIR}/${pkg}" 2>/dev/null
+        [ -f "${TEMP_DIR}/${pkg}" ] && rm -f "${TEMP_DIR}/${pkg}" 2>/dev/null
     done
     
     # Remove extracted files
     rm -f "${TEMP_DIR}"/*.ipk "${TEMP_DIR}"/*.tar.gz 2>/dev/null
-    rm -rf ./CONTROL ./control ./postinst ./preinst ./prerm ./postrm 2>/dev/null
+    rm -rf "${TEMP_DIR}/extract" 2>/dev/null
     rm -f "${INSTALL_LOG}" 2>/dev/null
     rm -f "${TEMP_DIR}/package_contents.txt" 2>/dev/null
 }
@@ -48,7 +53,7 @@ cleanup() {
 # Function: Print banner
 # ============================
 print_banner() {
-    clear
+    clear 2>/dev/null || printf "\n\n"
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
     echo -e "${WHITE}        ${PLUGIN_NAME} Plugin Installer v${VERSION}              ${NC}"
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
@@ -64,14 +69,24 @@ check_internet() {
     local connected=false
     local test_urls="https://github.com https://raw.githubusercontent.com https://google.com"
     
+    # First determine downloader
+    if command -v wget >/dev/null 2>&1; then
+        DOWNLOADER="wget"
+    elif command -v curl >/dev/null 2>&1; then
+        DOWNLOADER="curl"
+    else
+        echo -e "${RED}✗ Neither wget nor curl found. Please install one.${NC}"
+        exit 1
+    fi
+    
     for url in $test_urls; do
         if [ "${DOWNLOADER}" = "wget" ]; then
-            if wget --spider --timeout=5 -q "$url" 2>/dev/null; then
+            if wget --spider --timeout=3 -q "$url" 2>/dev/null; then
                 connected=true
                 break
             fi
         elif [ "${DOWNLOADER}" = "curl" ]; then
-            if curl -s --head --connect-timeout 5 "$url" >/dev/null 2>&1; then
+            if curl -s --head --connect-timeout 3 -m 5 "$url" >/dev/null 2>&1; then
                 connected=true
                 break
             fi
@@ -97,27 +112,19 @@ check_requirements() {
     # Check Enigma2 environment
     if [ ! -d "/usr/lib/enigma2" ]; then
         echo -e "${YELLOW}⚠ Warning: This doesn't appear to be an Enigma2 device${NC}"
-        sleep 2
+        sleep 1
     fi
     
     # Check available disk space (need at least 10MB)
-    AVAILABLE_SPACE=$(df /usr | awk 'NR==2 {print $4}')
-    if [ "${AVAILABLE_SPACE}" -lt 10240 ]; then
-        echo -e "${RED}✗ Insufficient disk space. Need at least 10MB${NC}"
-        exit 1
+    if [ -d "/usr" ]; then
+        AVAILABLE_SPACE=$(df /usr 2>/dev/null | awk 'NR==2 {print $4}')
+        if [ -n "${AVAILABLE_SPACE}" ] && [ "${AVAILABLE_SPACE}" -lt 10240 ] 2>/dev/null; then
+            echo -e "${RED}✗ Insufficient disk space. Need at least 10MB${NC}"
+            exit 1
+        fi
     fi
     
-    # Check for required download tools
-    if command -v wget >/dev/null 2>&1; then
-        DOWNLOADER="wget"
-    elif command -v curl >/dev/null 2>&1; then
-        DOWNLOADER="curl"
-    else
-        echo -e "${RED}✗ Neither wget nor curl found. Please install one.${NC}"
-        exit 1
-    fi
-    
-    # Check internet connectivity
+    # Check internet connectivity (sets DOWNLOADER)
     check_internet
 }
 
@@ -126,7 +133,6 @@ check_requirements() {
 # =============================================
 find_and_download_package() {
     local downloaded=false
-    local package_found=""
     
     # Try different package names
     for pkg_name in ${PACKAGE_NAMES}; do
@@ -135,12 +141,11 @@ find_and_download_package() {
         
         # Check if URL exists
         if [ "${DOWNLOADER}" = "wget" ]; then
-            if wget --spider --timeout=5 -q "${pkg_url}" 2>/dev/null; then
-                package_found="${pkg_name}"
-                
+            if wget --spider --timeout=3 -q "${pkg_url}" 2>/dev/null; then
+                echo -e "${GREEN}✓ Found: ${pkg_name}${NC}"
                 wget --no-check-certificate \
-                     --timeout=20 \
-                     --tries=3 \
+                     --timeout=15 \
+                     --tries=2 \
                      -q \
                      -O "${pkg_path}" \
                      "${pkg_url}" 2>/dev/null
@@ -152,10 +157,9 @@ find_and_download_package() {
                 fi
             fi
         elif [ "${DOWNLOADER}" = "curl" ]; then
-            if curl -s --head --connect-timeout 5 "${pkg_url}" | grep -q "200 OK"; then
-                package_found="${pkg_name}"
-                
-                curl -s -L -k --connect-timeout 20 --retry 3 -o "${pkg_path}" "${pkg_url}"
+            if curl -s --head --connect-timeout 3 -m 5 "${pkg_url}" 2>/dev/null | grep -q "200 OK"; then
+                echo -e "${GREEN}✓ Found: ${pkg_name}${NC}"
+                curl -s -L -k --connect-timeout 15 --retry 2 -o "${pkg_path}" "${pkg_url}"
                 
                 if [ $? -eq 0 ] && [ -s "${pkg_path}" ]; then
                     downloaded=true
@@ -188,19 +192,19 @@ remove_old_version() {
         if [ -d "$loc" ]; then
             # Backup configuration if exists
             if [ -f "${loc}/etc/config.xml" ] || [ -f "${loc}/config.xml" ]; then
-                mkdir -p "${BACKUP_DIR}"
+                mkdir -p "${BACKUP_DIR}" 2>/dev/null
                 
                 # Try to find config files
                 find "${loc}" -name "*.xml" -o -name "*.conf" -o -name "config.*" 2>/dev/null | while read -r cfg; do
                     rel_path="${cfg#$loc/}"
                     cfg_dir=$(dirname "${rel_path}")
-                    mkdir -p "${BACKUP_DIR}/${cfg_dir}"
+                    mkdir -p "${BACKUP_DIR}/${cfg_dir}" 2>/dev/null
                     cp -f "$cfg" "${BACKUP_DIR}/${cfg_dir}/" 2>/dev/null
                 done
             fi
             
             # Remove old version
-            rm -rf "$loc"
+            rm -rf "$loc" 2>/dev/null
         fi
     done
 }
@@ -213,7 +217,7 @@ install_package() {
     remove_old_version
     
     # Create plugin directory if it doesn't exist
-    mkdir -p "${ENIGMA2_PLUGINS_DIR}"
+    mkdir -p "${ENIGMA2_PLUGINS_DIR}" 2>/dev/null
     
     # First, check what's in the archive
     tar -tzf "${PACKAGE}" > "${TEMP_DIR}/package_contents.txt" 2>&1
@@ -223,30 +227,39 @@ install_package() {
         exit 1
     fi
     
-    # Check if package contains the plugin directory structure
-    if grep -q "${PLUGIN_NAME}/" "${TEMP_DIR}/package_contents.txt"; then
-        # Extract directly
-        tar -xzf "${PACKAGE}" -C / > "${INSTALL_LOG}" 2>&1
-    elif grep -q "^${PLUGIN_NAME}/" "${TEMP_DIR}/package_contents.txt"; then
-        # Extract to root
-        tar -xzf "${PACKAGE}" -C / > "${INSTALL_LOG}" 2>&1
-    else
-        # Create temporary extraction directory
-        mkdir -p "${TEMP_DIR}/extract"
-        tar -xzf "${PACKAGE}" -C "${TEMP_DIR}/extract" > "${INSTALL_LOG}" 2>&1
-        
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}✗ Extraction failed${NC}"
-            rm -rf "${TEMP_DIR}/extract"
-            exit 1
-        fi
-        
-        # Move contents to plugin directory
-        mkdir -p "${PLUGIN_DIR}"
-        cp -rf "${TEMP_DIR}/extract"/* "${PLUGIN_DIR}/" 2>/dev/null
-        cp -rf "${TEMP_DIR}/extract"/.[!.]* "${PLUGIN_DIR}/" 2>/dev/null
-        rm -rf "${TEMP_DIR}/extract"
+    # Create temporary extraction directory
+    mkdir -p "${TEMP_DIR}/extract" 2>/dev/null
+    rm -rf "${TEMP_DIR}/extract"/* 2>/dev/null
+    
+    # Extract to temporary directory first
+    tar -xzf "${PACKAGE}" -C "${TEMP_DIR}/extract" > "${INSTALL_LOG}" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}✗ Extraction failed${NC}"
+        exit 1
     fi
+    
+    # Check extracted contents and copy to correct location
+    if [ -d "${TEMP_DIR}/extract/${PLUGIN_NAME}" ]; then
+        # Package contains plugin directory
+        mkdir -p "${PLUGIN_DIR}" 2>/dev/null
+        cp -rf "${TEMP_DIR}/extract/${PLUGIN_NAME}"/* "${PLUGIN_DIR}/" 2>/dev/null
+    elif [ -d "${TEMP_DIR}/extract/usr/lib/enigma2/python/Plugins/Extensions/${PLUGIN_NAME}" ]; then
+        # Package contains full path
+        mkdir -p "${ENIGMA2_PLUGINS_DIR}" 2>/dev/null
+        cp -rf "${TEMP_DIR}/extract/usr/lib/enigma2/python/Plugins/Extensions/${PLUGIN_NAME}" "${ENIGMA2_PLUGINS_DIR}/" 2>/dev/null
+    elif [ -f "${TEMP_DIR}/extract/plugin.py" ] || [ -f "${TEMP_DIR}/extract/__init__.py" ]; then
+        # Package contains plugin files directly
+        mkdir -p "${PLUGIN_DIR}" 2>/dev/null
+        cp -rf "${TEMP_DIR}/extract"/* "${PLUGIN_DIR}/" 2>/dev/null
+    else
+        # Unknown structure, copy everything
+        mkdir -p "${PLUGIN_DIR}" 2>/dev/null
+        cp -rf "${TEMP_DIR}/extract"/* "${PLUGIN_DIR}/" 2>/dev/null
+    fi
+    
+    # Clean up temporary extraction
+    rm -rf "${TEMP_DIR}/extract" 2>/dev/null
     
     # Verify installation
     if [ ! -d "${PLUGIN_DIR}" ]; then
@@ -257,6 +270,7 @@ install_package() {
     # Restore configuration if backup exists
     if [ -d "${BACKUP_DIR}" ]; then
         cp -rf "${BACKUP_DIR}"/* "${PLUGIN_DIR}/" 2>/dev/null
+        rm -rf "${BACKUP_DIR}" 2>/dev/null
     fi
     
     # Set proper permissions
@@ -264,14 +278,12 @@ install_package() {
     find "${PLUGIN_DIR}" -type f -exec chmod 644 {} \; 2>/dev/null
     find "${PLUGIN_DIR}" -name "*.py" -exec chmod 755 {} \; 2>/dev/null
     find "${PLUGIN_DIR}" -name "*.sh" -exec chmod 755 {} \; 2>/dev/null
-    find "${PLUGIN_DIR}" -name "*.so" -exec chmod 755 {} \; 2>/dev/null
-    find "${PLUGIN_DIR}" -name "*.bin" -exec chmod 755 {} \; 2>/dev/null
     
     # Run post-installation scripts if exist
     for script in "postinst" "install.sh" "setup.sh"; do
         if [ -f "${PLUGIN_DIR}/${script}" ]; then
-            chmod 755 "${PLUGIN_DIR}/${script}"
-            cd "${PLUGIN_DIR}" && ./${script} >/dev/null 2>&1
+            chmod 755 "${PLUGIN_DIR}/${script}" 2>/dev/null
+            (cd "${PLUGIN_DIR}" && ./${script}) >/dev/null 2>&1 &
         fi
     done
 }
@@ -287,7 +299,6 @@ show_completion() {
     echo -e "${WHITE}   Plugin:     ${CYAN}${PLUGIN_NAME}${NC}"
     echo -e "${WHITE}   Version:    ${CYAN}${VERSION}${NC}"
     echo -e "${WHITE}   Location:   ${YELLOW}${PLUGIN_DIR}${NC}"
-    echo -e "${WHITE}   Developer:  ${MAGENTA}HAMDY_AHMED${NC}"
     echo -e "${GREEN}══════════════════════════════════════════════════════════════════${NC}"
     echo ""
 }
@@ -301,37 +312,41 @@ restart_enigma2() {
     echo -e "${YELLOW}══════════════════════════════════════════════════════════════════${NC}"
     echo ""
     
-    # Try different methods to restart Enigma2
     local restarted=false
     
     # Method 1: init (most common in Enigma2)
     if command -v init >/dev/null 2>&1; then
-        init 4
+        echo -e "${BLUE}  📡 Restarting via init...${NC}"
+        init 4 2>/dev/null
         sleep 2
-        init 3
+        init 3 2>/dev/null
         restarted=true
     fi
     
     # Method 2: systemctl
     if [ "$restarted" = false ] && command -v systemctl >/dev/null 2>&1; then
-        systemctl restart enigma2
+        echo -e "${BLUE}  📡 Restarting via systemctl...${NC}"
+        systemctl restart enigma2 2>/dev/null
         restarted=true
     fi
     
     # Method 3: killall
     if [ "$restarted" = false ] && command -v killall >/dev/null 2>&1; then
-        killall enigma2
+        echo -e "${BLUE}  📡 Restarting via killall...${NC}"
+        killall enigma2 2>/dev/null
         restarted=true
     fi
     
     # Method 4: init script
     if [ "$restarted" = false ] && [ -f "/etc/init.d/enigma2" ]; then
-        /etc/init.d/enigma2 restart
+        echo -e "${BLUE}  📡 Restarting via init script...${NC}"
+        /etc/init.d/enigma2 restart 2>/dev/null
         restarted=true
     fi
     
-    # Method 5: wget to webif
+    # Method 5: web interface
     if [ "$restarted" = false ]; then
+        echo -e "${BLUE}  📡 Trying web interface...${NC}"
         if command -v wget >/dev/null 2>&1; then
             wget -qO- "http://127.0.0.1/web/powerstate?newstate=3" >/dev/null 2>&1
             restarted=true
@@ -339,12 +354,6 @@ restart_enigma2() {
             curl -s "http://127.0.0.1/web/powerstate?newstate=3" >/dev/null 2>&1
             restarted=true
         fi
-    fi
-    
-    # Method 6: enigma2 restart command
-    if [ "$restarted" = false ] && [ -f "/usr/bin/enigma2" ]; then
-        /usr/bin/enigma2 --restart >/dev/null 2>&1
-        restarted=true
     fi
     
     if [ "$restarted" = false ]; then
@@ -390,3 +399,8 @@ main() {
     
     exit 0
 }
+
+# =========================
+# Execute main function
+# ========================
+main "$@"
